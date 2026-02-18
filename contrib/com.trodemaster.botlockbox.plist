@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  User-scope launchd agent for botlockbox.
+
+  Install:
+    cp com.trodemaster.botlockbox.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.trodemaster.botlockbox.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.trodemaster.botlockbox.plist
+    rm ~/Library/LaunchAgents/com.trodemaster.botlockbox.plist
+
+  age-plugin-se setup (one time):
+    age-plugin-se keygen --access-control none -o ~/.botlockbox/identity.txt
+    # note the "public key: age1se1q..." line in the output
+
+    printf 'my_secret: "value"\n' | botlockbox seal \
+      --config ~/.botlockbox/botlockbox.yaml \
+      --recipient age1se1q...
+
+  Secrets are bound to this machine's Secure Enclave. The identity file and
+  secrets.age file are useless on any other Mac. No Touch ID is required at
+  runtime because --access-control none was used at key generation.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.trodemaster.botlockbox</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/botlockbox</string>
+    <string>serve</string>
+    <string>--config</string>
+    <string>/Users/YOUR_USERNAME/.botlockbox/botlockbox.yaml</string>
+    <string>--identity</string>
+    <string>/Users/YOUR_USERNAME/.botlockbox/identity.txt</string>
+    <string>--pidfile</string>
+    <string>/Users/YOUR_USERNAME/.botlockbox/botlockbox.pid</string>
+    <string>--ca-cert</string>
+    <string>/Users/YOUR_USERNAME/.botlockbox/ca.pem</string>
+  </array>
+
+  <!-- age-plugin-se must be in PATH for age.Decrypt to invoke the plugin. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- Start at login and restart automatically if it exits. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USERNAME/.botlockbox/botlockbox.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USERNAME/.botlockbox/botlockbox.log</string>
+</dict>
+</plist>

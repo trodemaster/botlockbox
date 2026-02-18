@@ -49,7 +49,8 @@ jobs:
                   Authorization: "Bearer {{secrets.github_token}}"
           EOF
 
-      - name: Seal GITHUB_TOKEN into secrets.age
+      # Seal via --identity (X25519 path).
+      - name: Seal GITHUB_TOKEN into secrets.age via --identity
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -57,6 +58,19 @@ jobs:
             | ./bin/botlockbox seal \
                 --config /tmp/botlockbox.yaml \
                 --identity /tmp/identity.txt
+
+      # Seal via --recipient (plugin-key path, used with age-plugin-se on macOS).
+      # age-keygen writes "# public key: age1..." as a comment; extract it and
+      # re-seal using the public key string directly.
+      - name: Seal GITHUB_TOKEN into secrets.age via --recipient
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PUBKEY=$(grep '# public key:' /tmp/identity.txt | awk '{print $NF}')
+          printf 'github_token: "%s"\n' "$GITHUB_TOKEN" \
+            | ./bin/botlockbox seal \
+                --config /tmp/botlockbox.yaml \
+                --recipient "$PUBKEY"
 
       # -----------------------------------------------------------------------
       # Start proxy

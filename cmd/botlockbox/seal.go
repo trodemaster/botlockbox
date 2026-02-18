@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"filippo.io/age"
@@ -18,16 +19,18 @@ import (
 func runSeal(args []string) {
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	configPath := fs.String("config", "botlockbox.yaml", "path to botlockbox.yaml")
-	identityPath := fs.String("identity", "", "path to age identity file (required)")
+	identityPath := fs.String("identity", "", "path to age X25519 identity file (derives recipient from key)")
+	recipientStr := fs.String("recipient", "", "age recipient public key string (use for plugin keys such as age-plugin-se, e.g. age1se1q...)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: botlockbox seal [flags]")
 		fmt.Fprintln(os.Stderr, "Reads secrets from stdin as YAML (key: value pairs) and seals them.")
+		fmt.Fprintln(os.Stderr, "Exactly one of --identity or --recipient is required.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
 
-	if *identityPath == "" {
-		fmt.Fprintln(os.Stderr, "error: --identity is required")
+	if (*identityPath == "") == (*recipientStr == "") {
+		fmt.Fprintln(os.Stderr, "error: exactly one of --identity or --recipient is required")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -77,30 +80,11 @@ func runSeal(args []string) {
 		os.Exit(1)
 	}
 
-	// Parse age identity to get the recipient.
-	identityFile, err := os.Open(*identityPath)
+	recipient, err := resolveRecipient(*identityPath, *recipientStr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error opening identity file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error resolving recipient: %v\n", err)
 		os.Exit(1)
 	}
-	defer identityFile.Close()
-
-	identities, err := age.ParseIdentities(identityFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error parsing age identities: %v\n", err)
-		os.Exit(1)
-	}
-	if len(identities) == 0 {
-		fmt.Fprintln(os.Stderr, "error: no identities found in identity file")
-		os.Exit(1)
-	}
-
-	xi, ok := identities[0].(*age.X25519Identity)
-	if !ok {
-		fmt.Fprintln(os.Stderr, "error: identity is not an X25519 key")
-		os.Exit(1)
-	}
-	recipient := xi.Recipient()
 
 	// Ensure parent directory exists.
 	if err := os.MkdirAll(filepath.Dir(cfg.SecretsFile), 0700); err != nil {
@@ -137,4 +121,39 @@ func runSeal(args []string) {
 
 	fmt.Printf("Secrets sealed to %s\n", cfg.SecretsFile)
 	fmt.Printf("Config set to read-only (0444): %s\n", *configPath)
+}
+
+// resolveRecipient returns an age.Recipient from either a public key string
+// (for plugin keys such as age-plugin-se) or an X25519 identity file.
+func resolveRecipient(identityPath, recipientStr string) (age.Recipient, error) {
+	if recipientStr != "" {
+		recipients, err := age.ParseRecipients(strings.NewReader(recipientStr))
+		if err != nil {
+			return nil, fmt.Errorf("parsing recipient %q: %w", recipientStr, err)
+		}
+		if len(recipients) == 0 {
+			return nil, fmt.Errorf("no recipient found in %q", recipientStr)
+		}
+		return recipients[0], nil
+	}
+
+	// X25519 identity path: open the file and derive the recipient.
+	f, err := os.Open(identityPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening identity file: %w", err)
+	}
+	defer f.Close()
+
+	identities, err := age.ParseIdentities(f)
+	if err != nil {
+		return nil, fmt.Errorf("parsing identity file: %w", err)
+	}
+	if len(identities) == 0 {
+		return nil, fmt.Errorf("no identities found in %q", identityPath)
+	}
+	xi, ok := identities[0].(*age.X25519Identity)
+	if !ok {
+		return nil, fmt.Errorf("identity in %q is not an X25519 key; use --recipient with the public key string instead", identityPath)
+	}
+	return xi.Recipient(), nil
 }
