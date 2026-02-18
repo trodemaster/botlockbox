@@ -95,11 +95,12 @@ func runSeal(args []string) {
 		os.Exit(1)
 	}
 
-	recipient, ok := identities[0].(age.Recipient)
+	xi, ok := identities[0].(*age.X25519Identity)
 	if !ok {
-		fmt.Fprintln(os.Stderr, "error: identity does not implement age.Recipient")
+		fmt.Fprintln(os.Stderr, "error: identity is not an X25519 key")
 		os.Exit(1)
 	}
+	recipient := xi.Recipient()
 
 	// Ensure parent directory exists.
 	if err := os.MkdirAll(filepath.Dir(cfg.SecretsFile), 0700); err != nil {
