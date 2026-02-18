@@ -1,0 +1,156 @@
+name: Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: make build
+
+      - name: Install age
+        run: |
+          GOBIN=/usr/local/bin go install filippo.io/age/cmd/age-keygen@v1.3.1
+          GOBIN=/usr/local/bin go install filippo.io/age/cmd/age@v1.3.1
+
+      # -----------------------------------------------------------------------
+      # Setup: generate keys, config, and sealed secrets
+      # -----------------------------------------------------------------------
+      - name: Generate age identity
+        run: age-keygen -o /tmp/identity.txt
+
+      - name: Write botlockbox config
+        run: |
+          cat > /tmp/botlockbox.yaml <<'EOF'
+          listen: "127.0.0.1:8080"
+          secrets_file: /tmp/secrets.age
+          rules:
+            - name: github-api
+              match:
+                hosts:
+                  - "api.github.com"
+              inject:
+                headers:
+                  Authorization: "Bearer {{secrets.github_token}}"
+          EOF
+
+      - name: Seal GITHUB_TOKEN into secrets.age
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf 'github_token: "%s"\n' "$GITHUB_TOKEN" \
+            | ./bin/botlockbox seal \
+                --config /tmp/botlockbox.yaml \
+                --identity /tmp/identity.txt
+
+      # -----------------------------------------------------------------------
+      # Start proxy
+      # -----------------------------------------------------------------------
+      - name: Start botlockbox serve
+        run: |
+          ./bin/botlockbox serve \
+            --config /tmp/botlockbox.yaml \
+            --identity /tmp/identity.txt \
+            --ca-cert /tmp/botlockbox-ca.pem \
+            --pidfile /tmp/botlockbox.pid &
+
+      - name: Wait for proxy to be ready
+        run: |
+          for i in $(seq 1 40); do
+            if nc -z 127.0.0.1 8080 2>/dev/null; then
+              echo "Proxy is ready (attempt $i)"
+              exit 0
+            fi
+            sleep 0.25
+          done
+          echo "Proxy did not become ready in time" >&2
+          exit 1
+
+      - name: Trust botlockbox CA system-wide
+        run: |
+          sudo cp /tmp/botlockbox-ca.pem /usr/local/share/ca-certificates/botlockbox.crt
+          sudo update-ca-certificates
+
+      # -----------------------------------------------------------------------
+      # Tests
+      # -----------------------------------------------------------------------
+
+      # Baseline: unauthenticated request WITHOUT the proxy → 401
+      - name: Baseline - unauthenticated request returns 401
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://api.github.com/user)
+          echo "Status without proxy: $STATUS"
+          [ "$STATUS" = "401" ]
+
+      # Core test: botlockbox injects the real token even when gh carries a dummy token.
+      # GH_TOKEN=dummy forces gh to send "Authorization: Bearer dummy", which the
+      # proxy overwrites with the sealed real token before forwarding to GitHub.
+      - name: Proxy injects real token - gh api /user succeeds with dummy GH_TOKEN
+        env:
+          GH_TOKEN: dummy-credential
+          HTTPS_PROXY: http://127.0.0.1:8080
+        run: |
+          LOGIN=$(gh api /user --jq '.login')
+          echo "Logged in as: $LOGIN"
+          [ -n "$LOGIN" ]
+
+      # Verify the injected identity matches the token owner
+      - name: Proxy injects real token - curl returns valid user JSON
+        run: |
+          RESPONSE=$(curl -s \
+            --proxy http://127.0.0.1:8080 \
+            --cacert /tmp/botlockbox-ca.pem \
+            https://api.github.com/user)
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert 'login' in data, f'missing login field: {data}'
+          print('login:', data['login'])
+          "
+
+      # Confirm without proxy the dummy token is rejected → 401
+      - name: Dummy token without proxy returns 401
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer dummy-credential" \
+            https://api.github.com/user)
+          echo "Status with dummy token (no proxy): $STATUS"
+          [ "$STATUS" = "401" ]
+
+      # -----------------------------------------------------------------------
+      # Reload test
+      # -----------------------------------------------------------------------
+      - name: Reload secrets via SIGHUP
+        run: |
+          # Re-seal with the same token (simulates a rotation)
+          printf 'github_token: "%s"\n' "$GITHUB_TOKEN" \
+            | ./bin/botlockbox seal \
+                --config /tmp/botlockbox.yaml \
+                --identity /tmp/identity.txt
+
+          # Signal reload
+          ./bin/botlockbox reload --pidfile /tmp/botlockbox.pid
+          sleep 1
+
+          # Proxy must still serve requests correctly after reload
+          LOGIN=$(GH_TOKEN=dummy-credential HTTPS_PROXY=http://127.0.0.1:8080 \
+            gh api /user --jq '.login')
+          echo "After reload, logged in as: $LOGIN"
+          [ -n "$LOGIN" ]
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

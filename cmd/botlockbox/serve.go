@@ -111,6 +111,7 @@ func runServe(args []string) {
 	configPath := fs.String("config", "botlockbox.yaml", "path to botlockbox.yaml")
 	identityPath := fs.String("identity", "", "path to age identity file (required)")
 	pidfilePath := fs.String("pidfile", "", "path to write PID file (optional; used with 'botlockbox reload')")
+	caCertPath := fs.String("ca-cert", "", "path to write the ephemeral MITM CA public certificate PEM (optional; trust this cert in clients)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: botlockbox serve [flags]")
 		fmt.Fprintln(os.Stderr, "Decrypts secrets and starts the MITM proxy.")
@@ -145,6 +146,13 @@ func runServe(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error initializing proxy: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *caCertPath != "" {
+		if err := os.WriteFile(*caCertPath, injector.CACertPEM, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "error writing CA cert: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if *pidfilePath != "" {

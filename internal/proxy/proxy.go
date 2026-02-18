@@ -12,7 +12,7 @@ import (
 // New creates a goproxy server configured to inject credentials per the rules.
 // It returns the HTTP handler, the Injector (for live secret rotation via SwapSecrets), and any error.
 func New(cfg *config.Config, result *secrets.UnsealResult) (http.Handler, *Injector, error) {
-	ephemeralCA, err := GenerateEphemeralCA()
+	ephemeralCA, caCertPEM, err := GenerateEphemeralCA()
 	if err != nil {
 		return nil, nil, fmt.Errorf("generating ephemeral CA: %w", err)
 	}
@@ -34,6 +34,7 @@ func New(cfg *config.Config, result *secrets.UnsealResult) (http.Handler, *Injec
 		rules:         cfg.Rules,
 		envelope:      result.Envelope,
 		lockedSecrets: result.LockedSecrets,
+		CACertPEM:     caCertPEM,
 	}
 	p.OnRequest().DoFunc(injector.Handle)
 	InstallResponseScrubber(p)

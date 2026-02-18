@@ -14,14 +14,15 @@ import (
 
 // GenerateEphemeralCA creates a fresh CA cert and key entirely in memory.
 // Never written to disk. 24h lifetime limits blast radius.
-func GenerateEphemeralCA() (*tls.Certificate, error) {
+// Returns the TLS certificate and the PEM-encoded public certificate (safe to share with clients).
+func GenerateEphemeralCA() (*tls.Certificate, []byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	template := &x509.Certificate{
 		SerialNumber: serial,
@@ -37,18 +38,19 @@ func GenerateEphemeralCA() (*tls.Certificate, error) {
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cert, err := tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
+		certPEM,
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &cert, nil
+	return &cert, certPEM, nil
 }

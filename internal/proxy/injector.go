@@ -24,6 +24,10 @@ type Injector struct {
 	rules         []config.Rule
 	envelope      *secrets.SealedEnvelope
 	lockedSecrets map[string]*memguard.Enclave
+
+	// CACertPEM is the PEM-encoded public certificate of the ephemeral MITM CA.
+	// Safe to write to disk or share with clients that need to trust the proxy.
+	CACertPEM []byte
 }
 
 // Handle is the goproxy request handler.
