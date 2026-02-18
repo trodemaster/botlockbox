@@ -3,7 +3,16 @@ package secrets
 import (
 	"fmt"
 	"time"
+
+	"github.com/awnumar/memguard"
 )
+
+// UnsealResult holds the decrypted envelope and per-secret locked memory buffers
+// produced after successfully decrypting and validating a secrets.age file.
+type UnsealResult struct {
+	Envelope      *SealedEnvelope
+	LockedSecrets map[string]*memguard.Enclave
+}
 
 // SealedEnvelope is the structure that gets age-encrypted to disk.
 // It binds each secret to the exact set of hosts it is allowed to be sent to.

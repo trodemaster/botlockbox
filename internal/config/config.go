@@ -2,11 +2,7 @@ package config
 
 import (
 	"fmt"
-	"os"
 	"regexp"
-	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Config is the structure of botlockbox.yaml.
@@ -42,25 +38,6 @@ type Inject struct {
 	QueryParams map[string]string `yaml:"query_params,omitempty"`
 }
 
-// Load reads and parses a botlockbox.yaml config file.
-func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(expandHome(path))
-	if err != nil {
-		return nil, fmt.Errorf("reading config file %q: %w", path, err)
-	}
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
-	}
-	if cfg.Listen == "" {
-		cfg.Listen = "127.0.0.1:8080"
-	}
-	if cfg.SecretsFile == "" {
-		cfg.SecretsFile = "~/.botlockbox/secrets.age"
-	}
-	return &cfg, nil
-}
-
 // AllowedHostsFromRules derives the map[secretName][]hostGlob from the config's
 // rules by walking every inject directive and extracting referenced secret names.
 //
@@ -87,7 +64,6 @@ func (c *Config) AllowedHostsFromRules() (map[string][]string, error) {
 				}
 			}
 			result[secretName] = existing
-			}
 		}
 	}
 	return result, nil
@@ -120,12 +96,3 @@ func extractSecretNames(inject Inject) ([]string, error) {
 	return names, nil
 }
 
-func expandHome(path string) string {
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			return strings.Replace(path, "~", home, 1)
-		}
-	}
-	return path
-}
