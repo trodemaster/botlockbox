@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"text/template"
 
 	"github.com/awnumar/memguard"
@@ -19,6 +20,7 @@ var secretNameRe = regexp.MustCompile(`\{\{secrets\.(\w+)\}\}`)
 
 // Injector holds the rules, sealed envelope, and locked secrets.
 type Injector struct {
+	mu            sync.RWMutex
 	rules         []config.Rule
 	envelope      *secrets.SealedEnvelope
 	lockedSecrets map[string]*memguard.Enclave
@@ -26,6 +28,8 @@ type Injector struct {
 
 // Handle is the goproxy request handler.
 func (inj *Injector) Handle(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+	inj.mu.RLock()
+	defer inj.mu.RUnlock()
 	for _, rule := range inj.rules {
 		if matcher.Matches(req, rule.Match) {
 			if resp := inj.apply(req, rule); resp != nil {
@@ -149,4 +153,60 @@ func renderTemplate(tmplStr, secretName, secretValue string) (string, error) {
 		return buf.String(), nil
 	}
 	return result, nil
+}
+
+// SwapSecrets atomically replaces the live secrets after validating the new envelope.
+// Validation and AllowedHosts equality checks are performed before acquiring the write lock.
+// Old enclaves are destroyed after the swap. Returns an error without modifying state on failure.
+func (inj *Injector) SwapSecrets(newResult *secrets.UnsealResult, configAllowedHosts map[string][]string) error {
+	if err := newResult.Envelope.Validate(configAllowedHosts); err != nil {
+		return fmt.Errorf("reload validation failed: %w", err)
+	}
+
+	inj.mu.RLock()
+	oldAllowedHosts := inj.envelope.AllowedHosts
+	inj.mu.RUnlock()
+
+	if err := allowedHostsEqual(oldAllowedHosts, newResult.Envelope.AllowedHosts); err != nil {
+		return fmt.Errorf("reload rejected (AllowedHosts changed — re-seal required): %w", err)
+	}
+
+	inj.mu.Lock()
+	old := inj.lockedSecrets
+	inj.envelope = newResult.Envelope
+	inj.lockedSecrets = newResult.LockedSecrets
+	inj.mu.Unlock()
+
+	for _, enc := range old {
+		if buf, err := enc.Open(); err == nil {
+			buf.Destroy()
+		}
+	}
+	return nil
+}
+
+// allowedHostsEqual returns nil iff old and new contain identical key/value sets.
+func allowedHostsEqual(old, new map[string][]string) error {
+	if len(old) != len(new) {
+		return fmt.Errorf("key count changed: %d → %d", len(old), len(new))
+	}
+	for secretName, oldHosts := range old {
+		newHosts, ok := new[secretName]
+		if !ok {
+			return fmt.Errorf("secret %q removed from AllowedHosts", secretName)
+		}
+		if len(oldHosts) != len(newHosts) {
+			return fmt.Errorf("secret %q host count changed: %d → %d", secretName, len(oldHosts), len(newHosts))
+		}
+		newSet := make(map[string]struct{}, len(newHosts))
+		for _, h := range newHosts {
+			newSet[h] = struct{}{}
+		}
+		for _, h := range oldHosts {
+			if _, ok := newSet[h]; !ok {
+				return fmt.Errorf("secret %q host %q removed from AllowedHosts", secretName, h)
+			}
+		}
+	}
+	return nil
 }

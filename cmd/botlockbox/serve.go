@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"filippo.io/age"
 	"github.com/awnumar/memguard"
@@ -14,10 +16,101 @@ import (
 	"github.com/trodemaster/botlockbox/internal/secrets"
 )
 
+// mustParseIdentities opens and parses an age identity file, exiting on error.
+func mustParseIdentities(path string) []age.Identity {
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error opening identity file: %v\n", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+	identities, err := age.ParseIdentities(f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error parsing age identities: %v\n", err)
+		os.Exit(1)
+	}
+	return identities
+}
+
+// unseal decrypts secrets.age and returns a validated UnsealResult.
+func unseal(cfg *config.Config, identities []age.Identity, allowedHosts map[string][]string) (*secrets.UnsealResult, error) {
+	secretsFile, err := os.Open(cfg.SecretsFile)
+	if err != nil {
+		return nil, fmt.Errorf("opening secrets file %q: %w", cfg.SecretsFile, err)
+	}
+	defer secretsFile.Close()
+
+	ageReader, err := age.Decrypt(secretsFile, identities...)
+	if err != nil {
+		return nil, fmt.Errorf("decrypting secrets file: %w", err)
+	}
+
+	var envelope secrets.SealedEnvelope
+	if err := json.NewDecoder(ageReader).Decode(&envelope); err != nil {
+		return nil, fmt.Errorf("decoding sealed envelope: %w", err)
+	}
+
+	if err := envelope.Validate(allowedHosts); err != nil {
+		return nil, fmt.Errorf("SECURITY VIOLATION: %w", err)
+	}
+
+	lockedSecrets := make(map[string]*memguard.Enclave, len(envelope.Secrets))
+	for name, plaintext := range envelope.Secrets {
+		b := []byte(plaintext)
+		lockedSecrets[name] = memguard.NewEnclave(b)
+		memguard.ScrambleBytes(b)
+	}
+
+	return &secrets.UnsealResult{
+		Envelope:      &envelope,
+		LockedSecrets: lockedSecrets,
+	}, nil
+}
+
+// mustUnseal calls unseal and exits on failure (startup only).
+func mustUnseal(cfg *config.Config, identities []age.Identity, allowedHosts map[string][]string) *secrets.UnsealResult {
+	result, err := unseal(cfg, identities, allowedHosts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	return result
+}
+
+// writePIDFile writes the current process PID to path.
+func writePIDFile(path string) error {
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644)
+}
+
+// watchSIGHUP listens for SIGHUP signals and hot-reloads secrets via the injector.
+func watchSIGHUP(injector *proxy.Injector, cfg *config.Config, identities []age.Identity, allowedHosts map[string][]string) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
+	for range ch {
+		fmt.Println("botlockbox: SIGHUP received, reloading secrets...")
+		result, err := unseal(cfg, identities, allowedHosts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "botlockbox: reload FAILED (keeping current secrets): %v\n", err)
+			continue
+		}
+		if err := injector.SwapSecrets(result, allowedHosts); err != nil {
+			fmt.Fprintf(os.Stderr, "botlockbox: reload REJECTED (keeping current secrets): %v\n", err)
+			for _, enc := range result.LockedSecrets {
+				if buf, openErr := enc.Open(); openErr == nil {
+					buf.Destroy()
+				}
+			}
+			continue
+		}
+		fmt.Println("botlockbox: secrets reloaded successfully")
+	}
+}
+
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fs.String("config", "botlockbox.yaml", "path to botlockbox.yaml")
 	identityPath := fs.String("identity", "", "path to age identity file (required)")
+	pidfilePath := fs.String("pidfile", "", "path to write PID file (optional; used with 'botlockbox reload')")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: botlockbox serve [flags]")
 		fmt.Fprintln(os.Stderr, "Decrypts secrets and starts the MITM proxy.")
@@ -43,64 +136,26 @@ func runServe(args []string) {
 		os.Exit(1)
 	}
 
-	// Parse age identity.
-	identityFile, err := os.Open(*identityPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error opening identity file: %v\n", err)
-		os.Exit(1)
-	}
-	defer identityFile.Close()
-
-	identities, err := age.ParseIdentities(identityFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error parsing age identities: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Open and decrypt secrets file.
-	secretsFile, err := os.Open(cfg.SecretsFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error opening secrets file %q: %v\n", cfg.SecretsFile, err)
-		os.Exit(1)
-	}
-	defer secretsFile.Close()
-
-	ageReader, err := age.Decrypt(secretsFile, identities...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error decrypting secrets file: %v\n", err)
-		os.Exit(1)
-	}
-
-	var envelope secrets.SealedEnvelope
-	if err := json.NewDecoder(ageReader).Decode(&envelope); err != nil {
-		fmt.Fprintf(os.Stderr, "error decoding sealed envelope: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Validate envelope against live config — hard exit on mismatch.
-	if err := envelope.Validate(allowedHosts); err != nil {
-		fmt.Fprintf(os.Stderr, "SECURITY VIOLATION: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Lock each secret into guarded memory.
-	lockedSecrets := make(map[string]*memguard.Enclave, len(envelope.Secrets))
-	for name, plaintext := range envelope.Secrets {
-		b := []byte(plaintext)
-		lockedSecrets[name] = memguard.NewEnclave(b)
-		memguard.ScrambleBytes(b)
-	}
+	identities := mustParseIdentities(*identityPath)
+	result := mustUnseal(cfg, identities, allowedHosts)
 
 	applyHardening()
 
-	handler, err := proxy.New(cfg, &secrets.UnsealResult{
-		Envelope:      &envelope,
-		LockedSecrets: lockedSecrets,
-	})
+	handler, injector, err := proxy.New(cfg, result)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error initializing proxy: %v\n", err)
 		os.Exit(1)
 	}
+
+	if *pidfilePath != "" {
+		if err := writePIDFile(*pidfilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "error writing PID file: %v\n", err)
+			os.Exit(1)
+		}
+		defer os.Remove(*pidfilePath)
+	}
+
+	go watchSIGHUP(injector, cfg, identities, allowedHosts)
 
 	fmt.Println("Host binding verified")
 	fmt.Printf("botlockbox listening on %s\n", cfg.Listen)

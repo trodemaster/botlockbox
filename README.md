@@ -110,6 +110,78 @@ https_proxy=http://127.0.0.1:8080 \
 # Authorization: Bearer ghp_xxx injected transparently
 ```
 
+## CLI reference
+
+### `botlockbox seal`
+
+Reads plaintext secrets from stdin, binds them to the host allowlist derived from the config, and writes an `age`-encrypted envelope to `secrets_file`. Also sets the config to read-only (`0444`) to prevent post-seal tampering.
+
+```
+botlockbox seal --config <path> --identity <path>
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `botlockbox.yaml` | Path to `botlockbox.yaml` |
+| `--identity` | _(required)_ | Path to an `age` identity file (e.g. `~/.age/identity.txt`) |
+
+**Stdin format** — YAML key/value pairs, one secret per line:
+
+```yaml
+github_token: "ghp_xxxxxxxxxxxxxxxxxxxx"
+openai_key: "sk-xxxxxxxxxxxxxxxxxxxx"
+```
+
+Every secret name referenced in a `{{secrets.NAME}}` template in the config must be present on stdin. Missing secrets are a hard error.
+
+**Output:**
+
+```
+Secrets sealed to /home/user/.botlockbox/secrets.age
+Config set to read-only (0444): botlockbox.yaml
+```
+
+**Re-sealing** — run `seal` again any time you rotate a secret or add a new host to the config. The previous `secrets.age` is overwritten atomically.
+
+---
+
+### `botlockbox serve`
+
+Decrypts the sealed envelope, validates it against the live config, loads secrets into locked memory, and starts the MITM proxy.
+
+```
+botlockbox serve --config <path> --identity <path>
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `botlockbox.yaml` | Path to `botlockbox.yaml` |
+| `--identity` | _(required)_ | Path to an `age` identity file |
+
+**Startup sequence:**
+
+1. Load and parse `botlockbox.yaml`
+2. Decrypt `secrets_file` using the age identity
+3. Validate the sealed envelope against the live config — any secret or host present in the config that was not committed at seal time causes an immediate `os.Exit(1)` with a descriptive error
+4. Load each secret into a `memguard` encrypted enclave; scramble the plaintext bytes immediately
+5. Apply OS hardening (`PR_SET_DUMPABLE=0`, `mlockall`, `RLIMIT_CORE=0` on Linux)
+6. Generate an ephemeral in-memory ECDSA P-256 MITM CA (24 h lifetime, never written to disk)
+7. Begin accepting connections
+
+**Output on successful start:**
+
+```
+Host binding verified
+botlockbox listening on 127.0.0.1:8080
+```
+
+**Security violation example** (config edited after seal):
+
+```
+SECURITY VIOLATION: secret "github_token" is referenced in botlockbox.yaml but was not present at seal time -- re-seal to add new secrets
+exit status 1
+```
+
 ## Config reference
 
 | Field | Type | Default | Description |
