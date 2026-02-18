@@ -1,0 +1,73 @@
+# contrib/docker-compose.example.yml
+#
+# Example Docker Compose setup for running MCP servers in containers on a Mac
+# host while botlockbox provides credential injection from the host.
+#
+# Prerequisites:
+#   1. botlockbox is running on the Mac host via launchd (Mode 1 — Secure Enclave).
+#   2. botlockbox.yaml uses  listen: "0.0.0.0:8080"  (NOT 127.0.0.1).
+#      Without this, Docker containers cannot reach the proxy.
+#   3. The CA cert has been written to ~/.botlockbox/ca.pem via
+#      --ca-cert ~/.botlockbox/ca.pem in the launchd plist.
+#
+# Usage:
+#   docker compose -f contrib/docker-compose.example.yml up
+#
+# No credentials are placed in any container.
+# botlockbox on the Mac host injects Authorization / API headers
+# transparently before forwarding requests to external APIs.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reusable YAML anchors — merge these into any service's environment block.
+# ──────────────────────────────────────────────────────────────────────────────
+
+x-botlockbox-proxy: &botlockbox-proxy
+  # Route all HTTP/HTTPS traffic through botlockbox on the Mac host.
+  # Docker Desktop resolves host.docker.internal to the host IP automatically.
+  HTTP_PROXY:  "http://host.docker.internal:8080"
+  HTTPS_PROXY: "http://host.docker.internal:8080"
+  http_proxy:  "http://host.docker.internal:8080"
+  https_proxy: "http://host.docker.internal:8080"
+  # Keep container-local and LAN traffic off the proxy.
+  NO_PROXY: "localhost,127.0.0.1,*.local"
+
+x-botlockbox-ca: &botlockbox-ca
+  # Trust the botlockbox ephemeral MITM CA for each language runtime.
+  # All point at the same mounted PEM — no code changes or image rebuilds needed.
+  REQUESTS_CA_BUNDLE: /etc/botlockbox/ca.pem   # Python: requests, httpx, boto3, openai-sdk
+  NODE_EXTRA_CA_CERTS: /etc/botlockbox/ca.pem  # Node.js: all https / fetch
+  SSL_CERT_FILE: /etc/botlockbox/ca.pem        # Go stdlib, Ruby net/http
+  CURL_CA_BUNDLE: /etc/botlockbox/ca.pem       # curl, libcurl (many CLIs)
+
+services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Replace this with your actual MCP server image.
+  # The only required additions are the environment and volumes blocks below.
+  # ──────────────────────────────────────────────────────────────────────────
+  mcp-server:
+    image: your-mcp-server-image:latest
+    environment:
+      <<: [*botlockbox-proxy, *botlockbox-ca]
+      # Your MCP server's own non-secret config goes here.
+      # API keys / tokens are NOT needed — botlockbox injects them.
+      # MCP_SERVER_PORT: "3000"
+    volumes:
+      # Mount the botlockbox CA cert from the Mac host (read-only).
+      - "${HOME}/.botlockbox/ca.pem:/etc/botlockbox/ca.pem:ro"
+    extra_hosts:
+      # Ensures host.docker.internal resolves on Linux Docker hosts too.
+      # Ignored (harmless) on Docker Desktop for Mac.
+      - "host.docker.internal:host-gateway"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Second service example: a Python-based MCP server.
+  # Add as many services as needed; each gets the same proxy + CA config.
+  # ──────────────────────────────────────────────────────────────────────────
+  mcp-fetch:
+    image: ghcr.io/modelcontextprotocol/mcp-server-fetch:latest
+    environment:
+      <<: [*botlockbox-proxy, *botlockbox-ca]
+    volumes:
+      - "${HOME}/.botlockbox/ca.pem:/etc/botlockbox/ca.pem:ro"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

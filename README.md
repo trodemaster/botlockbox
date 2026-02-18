@@ -281,6 +281,80 @@ In Docker, this is a two-stage entrypoint: start the proxy as root, then `exec s
 
 ---
 
+### Mode 3: MCP containers on a Mac host (Docker Compose)
+
+Run MCP servers in Docker containers while botlockbox provides credential injection from the Mac host. The containers carry **zero credentials** — all `Authorization` headers are injected by botlockbox before requests reach external APIs.
+
+This works with any MCP server that respects standard HTTP proxy environment variables. No changes to MCP server images are required.
+
+```mermaid
+flowchart TD
+    subgraph mac["Mac Host"]
+        SE["Secure Enclave\n(age-plugin-se)"]
+        BLB["botlockbox\nlisten: 0.0.0.0:8080\n(launchd agent)"]
+        CAPEM["~/.botlockbox/ca.pem"]
+        SE -->|"decrypts silently\nno Touch ID"| BLB
+        BLB -->|"--ca-cert"| CAPEM
+    end
+
+    subgraph docker["Docker Desktop (bridge network)"]
+        MCP1["MCP server A\nPython\nREQUESTS_CA_BUNDLE=\n/etc/botlockbox/ca.pem"]
+        MCP2["MCP server B\nNode.js\nNODE_EXTRA_CA_CERTS=\n/etc/botlockbox/ca.pem"]
+        MCP1 & MCP2 -->|"volume mount :ro"| VOL["/etc/botlockbox/ca.pem"]
+    end
+
+    CAPEM -->|"bind mount"| VOL
+
+    MCP1 -->|"HTTPS_PROXY=\nhost.docker.internal:8080"| BLB
+    MCP2 -->|"HTTPS_PROXY=\nhost.docker.internal:8080"| BLB
+    BLB -->|"Authorization injected\nfrom enclave"| API["External APIs\nOpenAI, GitHub…"]
+```
+
+**Prerequisites:**
+
+1. botlockbox running on the Mac host (Mode 1 — launchd + Secure Enclave).
+2. `listen: "0.0.0.0:8080"` in `botlockbox.yaml` — the default `127.0.0.1` is unreachable from Docker's bridge network.
+3. CA cert written to `~/.botlockbox/ca.pem` via `--ca-cert ~/.botlockbox/ca.pem` in the launchd plist.
+
+**Docker Compose config** (full template in `contrib/docker-compose.example.yml`):
+
+```yaml
+x-botlockbox-proxy: &botlockbox-proxy
+  HTTP_PROXY:  "http://host.docker.internal:8080"
+  HTTPS_PROXY: "http://host.docker.internal:8080"
+  http_proxy:  "http://host.docker.internal:8080"
+  https_proxy: "http://host.docker.internal:8080"
+  NO_PROXY: "localhost,127.0.0.1,*.local"
+
+x-botlockbox-ca: &botlockbox-ca
+  REQUESTS_CA_BUNDLE: /etc/botlockbox/ca.pem   # Python (requests, httpx, boto3, openai-sdk)
+  NODE_EXTRA_CA_CERTS: /etc/botlockbox/ca.pem  # Node.js
+  SSL_CERT_FILE: /etc/botlockbox/ca.pem        # Go stdlib, Ruby net/http
+  CURL_CA_BUNDLE: /etc/botlockbox/ca.pem       # curl / libcurl
+
+services:
+  mcp-server:
+    image: your-mcp-server-image:latest
+    environment:
+      <<: [*botlockbox-proxy, *botlockbox-ca]
+      # No API keys here — botlockbox injects them.
+    volumes:
+      - "${HOME}/.botlockbox/ca.pem:/etc/botlockbox/ca.pem:ro"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # needed on Linux Docker; harmless on Mac
+```
+
+**How it works:**
+
+1. Docker Desktop resolves `host.docker.internal` to the Mac host IP automatically.
+2. `HTTPS_PROXY` causes the container's HTTP library to tunnel all HTTPS through botlockbox.
+3. botlockbox MITMs the TLS session with its ephemeral CA, injects the credential from the Secure Enclave, and forwards the request.
+4. The CA cert is mounted read-only from the Mac host; each language runtime trusts it via its own env var — no code changes, no image rebuilds.
+
+**The MCP server's perspective:** it makes a normal HTTPS call to `api.openai.com`. The response arrives and credentials were never in its environment.
+
+---
+
 ## CLI reference
 
 ### `botlockbox seal`
