@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,6 +29,23 @@ func mustParseIdentities(path string) []age.Identity {
 	identities, err := age.ParseIdentities(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error parsing age identities: %v\n", err)
+		os.Exit(1)
+	}
+	return identities
+}
+
+// mustParseIdentitiesFromReader parses age identities from r, then scrambles
+// the source bytes so the key material does not linger in our buffer.
+func mustParseIdentitiesFromReader(r io.Reader) []age.Identity {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading identity from stdin: %v\n", err)
+		os.Exit(1)
+	}
+	defer memguard.ScrambleBytes(data)
+	identities, err := age.ParseIdentities(bytes.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error parsing age identities from stdin: %v\n", err)
 		os.Exit(1)
 	}
 	return identities
@@ -109,18 +128,25 @@ func watchSIGHUP(injector *proxy.Injector, cfg *config.Config, identities []age.
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	configPath := fs.String("config", "botlockbox.yaml", "path to botlockbox.yaml")
-	identityPath := fs.String("identity", "", "path to age identity file (required)")
+	identityPath := fs.String("identity", "", "path to age identity file (mutually exclusive with --identity-stdin)")
+	identityStdin := fs.Bool("identity-stdin", false, "read age identity from stdin; key is never written to disk (mutually exclusive with --identity)")
 	pidfilePath := fs.String("pidfile", "", "path to write PID file (optional; used with 'botlockbox reload')")
 	caCertPath := fs.String("ca-cert", "", "path to write the ephemeral MITM CA public certificate PEM (optional; trust this cert in clients)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: botlockbox serve [flags]")
 		fmt.Fprintln(os.Stderr, "Decrypts secrets and starts the MITM proxy.")
+		fmt.Fprintln(os.Stderr, "Exactly one of --identity or --identity-stdin is required.")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
 
-	if *identityPath == "" {
-		fmt.Fprintln(os.Stderr, "error: --identity is required")
+	if *identityPath != "" && *identityStdin {
+		fmt.Fprintln(os.Stderr, "error: --identity and --identity-stdin are mutually exclusive")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if *identityPath == "" && !*identityStdin {
+		fmt.Fprintln(os.Stderr, "error: one of --identity or --identity-stdin is required")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -137,7 +163,12 @@ func runServe(args []string) {
 		os.Exit(1)
 	}
 
-	identities := mustParseIdentities(*identityPath)
+	var identities []age.Identity
+	if *identityStdin {
+		identities = mustParseIdentitiesFromReader(os.Stdin)
+	} else {
+		identities = mustParseIdentities(*identityPath)
+	}
 	result := mustUnseal(cfg, identities, allowedHosts)
 
 	applyHardening()

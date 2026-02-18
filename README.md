@@ -110,6 +110,177 @@ https_proxy=http://127.0.0.1:8080 \
 # Authorization: Bearer ghp_xxx injected transparently
 ```
 
+---
+
+## Deployment modes
+
+### Mode 1: Mac persistent proxy with Secure Enclave key
+
+Use [`age-plugin-se`](https://github.com/remko/age-plugin-se) to bind `secrets.age` to a specific Mac's Secure Enclave. The private key is generated inside the chip and **cannot be exported or used on any other machine**. With `--access-control none`, decryption is silent — no Touch ID prompt — making it suitable for a `launchd` user-session agent that starts at login.
+
+```mermaid
+flowchart TD
+    subgraph setup["One-time setup"]
+        direction LR
+        KG["age-plugin-se keygen\n--access-control none"]
+        SE["Secure Enclave\nT2 / M-series"]
+        SE -->|"generates &amp; stores\nprivate key in hardware"| KG
+        KG -->|"identity reference\n(AGE-PLUGIN-SE-1…)"| IDFILE["~/.botlockbox/identity.txt"]
+        KG -->|"public key\n(age1se1q…)"| SEAL
+        CREDS["credentials\n(stdin, plaintext)"] --> SEAL["botlockbox seal\n--recipient age1se1q…"]
+        SEAL -->|"device-bound\nciphertext"| SAGE["secrets.age"]
+    end
+
+    subgraph runtime["Every login — launchd user-session agent"]
+        direction LR
+        LAUNCHD["launchd"] -->|"starts at login\nKeepAlive: true"| SERVE["botlockbox serve\n--identity identity.txt"]
+        IDFILE -->|"identity ref"| SERVE
+        SAGE -->|"ciphertext"| SERVE
+        SERVE -->|"SE decrypts silently\nno Touch ID"| MEM["secrets in\nmemguard enclaves"]
+        AGENT["AI agent / MCP / CLI\nno credentials"] -->|"HTTPS_PROXY=\nlocalhost:8080"| SERVE
+        SERVE -->|"Authorization injected\nfrom enclave"| API["External API"]
+    end
+
+    SAGE -.->|"useless on\nany other Mac"| LOCK["🔒 device-bound"]
+```
+
+**One-time setup:**
+
+```bash
+# Install age-plugin-se (e.g. via Homebrew)
+brew install age-plugin-se
+
+# Generate a key bound to this Mac's Secure Enclave (no Touch ID at runtime)
+age-plugin-se keygen --access-control none -o ~/.botlockbox/identity.txt
+# note the "public key: age1se1q..." line
+
+# Seal your credentials to that public key
+printf 'openai_key: "sk-xxxx"\ngithub_token: "ghp_xxxx"\n' \
+  | botlockbox seal \
+      --config ~/.botlockbox/botlockbox.yaml \
+      --recipient age1se1q...
+```
+
+**Install as a launchd user-session agent** (see `contrib/com.trodemaster.botlockbox.plist` for the full template):
+
+```bash
+# Edit the plist to set your username and paths, then:
+cp contrib/com.trodemaster.botlockbox.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.trodemaster.botlockbox.plist
+```
+
+The proxy starts at every login. `secrets.age` and `identity.txt` are useless on any other Mac — hardware binding without prompts.
+
+**Rotating a secret:**
+
+```bash
+# Re-seal with the new credential value
+printf 'openai_key: "sk-new"\ngithub_token: "ghp_xxxx"\n' \
+  | botlockbox seal \
+      --config ~/.botlockbox/botlockbox.yaml \
+      --recipient age1se1q...
+
+# Hot-reload the running proxy (no restart, zero dropped connections)
+botlockbox reload --pidfile ~/.botlockbox/botlockbox.pid
+```
+
+---
+
+### Mode 2: GitHub Actions self-hosted runner (ephemeral key)
+
+The runner hosts AI agents that call external APIs. Credentials live in GitHub Actions secrets and are never placed in agent environment variables. An ephemeral age key is generated fresh for each workflow run and piped directly to `botlockbox serve` via `--identity-stdin` — **the private key never touches disk**.
+
+```mermaid
+flowchart TD
+    subgraph gha["GitHub Actions workflow — self-hosted runner"]
+        direction TB
+
+        subgraph setup["Job startup (root / botlockbox user)"]
+            GHS["GitHub Actions secrets\nOPENAI_KEY, GITHUB_TOKEN…"]
+            KEYGEN["age-keygen\nephemeral keypair"]
+            PUBKEY["public key\nshell variable only"]
+            PRIVKEY["private key\nshell variable only"]
+            KEYGEN --> PUBKEY
+            KEYGEN --> PRIVKEY
+            GHS --> SEAL["botlockbox seal\n--recipient \$PUBKEY"]
+            PUBKEY --> SEAL
+            SEAL --> SAGE["secrets.age\nrun-scoped"]
+            PRIVKEY -->|"piped via stdin"| SERVE["botlockbox serve\n--identity-stdin"]
+            SAGE --> SERVE
+            SERVE -->|"decrypts once\nscrambles key buffer"| MEM["secrets in\nmemguard enclaves"]
+        end
+
+        subgraph run["Agent execution (unprivileged user)"]
+            AGENT["AI agent\nuid: agent"]
+            AGENT -->|"HTTPS_PROXY=localhost:8080\nno credentials in env"| SERVE
+            SERVE -->|"Authorization injected\nfrom enclave"| API["External API"]
+        end
+    end
+
+    KEYGEN -.->|"shell vars gone\nafter step exits"| GONE["🗑 ephemeral"]
+    SERVE -.->|"cannot read identity.txt\n(it does not exist)"| NOFILE["no key on disk"]
+```
+
+**Workflow pattern:**
+
+```yaml
+jobs:
+  run-agent:
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start botlockbox (key never touches disk)
+        env:
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+        run: |
+          # Generate a fresh ephemeral keypair for this run
+          IDENTITY=$(age-keygen)
+          PUBKEY=$(echo "$IDENTITY" | grep '# public key:' | awk '{print $NF}')
+
+          # Seal the credentials to the ephemeral public key
+          printf 'openai_key: "%s"\n' "$OPENAI_KEY" \
+            | botlockbox seal --config botlockbox.yaml --recipient "$PUBKEY"
+
+          # Pipe the private key directly to serve — never written to disk
+          echo "$IDENTITY" | botlockbox serve \
+            --config botlockbox.yaml \
+            --identity-stdin \
+            --ca-cert /tmp/botlockbox-ca.pem \
+            --pidfile /tmp/botlockbox.pid &
+
+          # Trust the ephemeral CA so agent tools can verify TLS
+          sudo cp /tmp/botlockbox-ca.pem /usr/local/share/ca-certificates/botlockbox.crt
+          sudo update-ca-certificates
+
+      - name: Run agent (no credentials in environment)
+        run: |
+          HTTPS_PROXY=http://127.0.0.1:8080 python agent.py
+```
+
+**What this protects against:**
+
+| Threat | Without botlockbox | With botlockbox |
+|--------|-------------------|-----------------|
+| Agent reads `$OPENAI_KEY` from env | ✗ exposed | ✓ not in env |
+| Agent reads credentials from disk | ✗ if written to file | ✓ never on disk |
+| Agent logs or exfiltrates request body | ✗ credential visible | ✓ scrubbed from responses |
+| Leaked `secrets.age` file after run | ✗ decryptable with key | ✓ key is ephemeral, gone after job |
+| Agent calls an unlisted host | ✗ no enforcement | ✓ sealed allowlist blocks injection |
+
+**Process isolation (recommended):**
+
+For stronger isolation, run botlockbox as a privileged user and the agent as a separate unprivileged user. The agent can reach the proxy over TCP but cannot read botlockbox's memory or files.
+
+```
+uid 0 / botlockbox: botlockbox serve --identity-stdin ...
+uid 1001 / agent:   HTTPS_PROXY=http://127.0.0.1:8080 python agent.py
+```
+
+In Docker, this is a two-stage entrypoint: start the proxy as root, then `exec su -c "python agent.py" agent`.
+
+---
+
 ## CLI reference
 
 ### `botlockbox seal`
@@ -117,15 +288,18 @@ https_proxy=http://127.0.0.1:8080 \
 Reads plaintext secrets from stdin, binds them to the host allowlist derived from the config, and writes an `age`-encrypted envelope to `secrets_file`. Also sets the config to read-only (`0444`) to prevent post-seal tampering.
 
 ```
-botlockbox seal --config <path> --identity <path>
+botlockbox seal --config <path> (--identity <path> | --recipient <pubkey>)
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | `botlockbox.yaml` | Path to `botlockbox.yaml` |
-| `--identity` | _(required)_ | Path to an `age` identity file (e.g. `~/.age/identity.txt`) |
+| `--identity` | — | Path to an age X25519 identity file; derives the recipient from the key. Mutually exclusive with `--recipient`. |
+| `--recipient` | — | Age public key string (`age1…` or `age1se1…`). Use this for plugin keys such as `age-plugin-se`. Mutually exclusive with `--identity`. |
 
-**Stdin format** — YAML key/value pairs, one secret per line:
+Exactly one of `--identity` or `--recipient` is required.
+
+**Stdin format** — YAML key/value pairs:
 
 ```yaml
 github_token: "ghp_xxxxxxxxxxxxxxxxxxxx"
@@ -133,13 +307,6 @@ openai_key: "sk-xxxxxxxxxxxxxxxxxxxx"
 ```
 
 Every secret name referenced in a `{{secrets.NAME}}` template in the config must be present on stdin. Missing secrets are a hard error.
-
-**Output:**
-
-```
-Secrets sealed to /home/user/.botlockbox/secrets.age
-Config set to read-only (0444): botlockbox.yaml
-```
 
 **Re-sealing** — run `seal` again any time you rotate a secret or add a new host to the config. The previous `secrets.age` is overwritten atomically.
 
@@ -150,37 +317,45 @@ Config set to read-only (0444): botlockbox.yaml
 Decrypts the sealed envelope, validates it against the live config, loads secrets into locked memory, and starts the MITM proxy.
 
 ```
-botlockbox serve --config <path> --identity <path>
+botlockbox serve --config <path> (--identity <path> | --identity-stdin) [flags]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | `botlockbox.yaml` | Path to `botlockbox.yaml` |
-| `--identity` | _(required)_ | Path to an `age` identity file |
+| `--identity` | — | Path to an age identity file. Mutually exclusive with `--identity-stdin`. |
+| `--identity-stdin` | `false` | Read age identity from stdin; the key is never written to disk. Mutually exclusive with `--identity`. |
+| `--pidfile` | — | Write the proxy PID here; used by `botlockbox reload`. |
+| `--ca-cert` | — | Write the ephemeral MITM CA public certificate PEM here so clients can trust it. |
+
+Exactly one of `--identity` or `--identity-stdin` is required.
 
 **Startup sequence:**
 
 1. Load and parse `botlockbox.yaml`
 2. Decrypt `secrets_file` using the age identity
-3. Validate the sealed envelope against the live config — any secret or host present in the config that was not committed at seal time causes an immediate `os.Exit(1)` with a descriptive error
+3. Validate the sealed envelope against the live config — any secret or host present in the config that was not committed at seal time causes an immediate `os.Exit(1)`
 4. Load each secret into a `memguard` encrypted enclave; scramble the plaintext bytes immediately
 5. Apply OS hardening (`PR_SET_DUMPABLE=0`, `mlockall`, `RLIMIT_CORE=0` on Linux)
 6. Generate an ephemeral in-memory ECDSA P-256 MITM CA (24 h lifetime, never written to disk)
-7. Begin accepting connections
+7. Write CA cert PEM and PID file if requested
+8. Begin accepting connections
 
-**Output on successful start:**
+---
 
-```
-Host binding verified
-botlockbox listening on 127.0.0.1:8080
-```
+### `botlockbox reload`
 
-**Security violation example** (config edited after seal):
+Sends SIGHUP to a running `serve` process, triggering a live secret reload. The proxy keeps serving with old secrets if the reload fails for any reason.
 
 ```
-SECURITY VIOLATION: secret "github_token" is referenced in botlockbox.yaml but was not present at seal time -- re-seal to add new secrets
-exit status 1
+botlockbox reload --pidfile <path>
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pidfile` | _(required)_ | Path to the PID file written by `botlockbox serve`. |
+
+---
 
 ## Config reference
 
@@ -189,13 +364,12 @@ exit status 1
 | `listen` | string | `127.0.0.1:8080` | Proxy listen address |
 | `secrets_file` | string | `~/.botlockbox/secrets.age` | Path to age-encrypted secrets |
 | `verbose` | bool | `false` | Log every proxied request |
-| `identity_file` | string | -- | Default age identity file path |
-| `rules` | list | -- | Credential injection rules |
-| `rules[].name` | string | -- | Human-readable rule name (appears in audit log) |
-| `rules[].match.hosts` | list | -- | Host glob patterns (`*.example.com` supported) |
-| `rules[].match.path_prefixes` | list | -- | Optional URL path prefix filters |
-| `rules[].inject.headers` | map | -- | Request headers to inject; supports `{{secrets.NAME}}` |
-| `rules[].inject.query_params` | map | -- | Query parameters to inject; supports `{{secrets.NAME}}` |
+| `rules` | list | — | Credential injection rules |
+| `rules[].name` | string | — | Human-readable rule name (appears in audit log) |
+| `rules[].match.hosts` | list | — | Host glob patterns (`*.example.com` supported) |
+| `rules[].match.path_prefixes` | list | — | Optional URL path prefix filters |
+| `rules[].inject.headers` | map | — | Request headers to inject; supports `{{secrets.NAME}}` |
+| `rules[].inject.query_params` | map | — | Query parameters to inject; supports `{{secrets.NAME}}` |
 
 ## Secrets file format
 
@@ -207,7 +381,7 @@ openai_key: "sk-xxxxxxxxxxxxxxxxxxxx"
 aws_session_token: "IQoJb3..."
 ```
 
-The only artifact written to disk is `~/.botlockbox/secrets.age` -- an opaque `age`-encrypted blob.
+The only artifact written to disk is `secrets.age` -- an opaque `age`-encrypted blob.
 
 ## Deployment posture
 
@@ -237,7 +411,7 @@ The only artifact written to disk is `~/.botlockbox/secrets.age` -- an opaque `a
 ```bash
 make build    # compile to bin/botlockbox
 make install  # go install
-make test     # go test ./...
+make test     # go test -race ./...
 make lint     # go vet ./...
 make tidy     # go mod tidy
 ```

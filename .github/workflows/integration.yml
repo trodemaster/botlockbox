@@ -73,13 +73,13 @@ jobs:
                 --recipient "$PUBKEY"
 
       # -----------------------------------------------------------------------
-      # Start proxy
+      # Start proxy via --identity-stdin (key never touches disk after this point)
       # -----------------------------------------------------------------------
-      - name: Start botlockbox serve
+      - name: Start botlockbox serve via --identity-stdin
         run: |
-          ./bin/botlockbox serve \
+          cat /tmp/identity.txt | ./bin/botlockbox serve \
             --config /tmp/botlockbox.yaml \
-            --identity /tmp/identity.txt \
+            --identity-stdin \
             --ca-cert /tmp/botlockbox-ca.pem \
             --pidfile /tmp/botlockbox.pid &
 
