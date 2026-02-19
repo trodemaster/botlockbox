@@ -122,26 +122,26 @@ Use [`age-plugin-se`](https://github.com/remko/age-plugin-se) to bind `secrets.a
 flowchart TD
     subgraph setup["One-time setup"]
         direction LR
-        KG["age-plugin-se keygen\n--access-control none"]
-        SE["Secure Enclave\nT2 / M-series"]
-        SE -->|"generates &amp; stores\nprivate key in hardware"| KG
-        KG -->|"identity reference\n(AGE-PLUGIN-SE-1…)"| IDFILE["~/.botlockbox/identity.txt"]
-        KG -->|"public key\n(age1se1q…)"| SEAL
-        CREDS["credentials\n(stdin, plaintext)"] --> SEAL["botlockbox seal\n--recipient age1se1q…"]
-        SEAL -->|"device-bound\nciphertext"| SAGE["secrets.age"]
+        KG["age-plugin-se keygen<br/>--access-control none"]
+        SE["Secure Enclave<br/>T2 / M-series"]
+        SE -->|"generates and stores private key in hardware"| KG
+        KG -->|"identity reference (AGE-PLUGIN-SE-1…)"| IDFILE["~/.botlockbox/identity.txt"]
+        KG -->|"public key (age1se1q…)"| SEAL
+        CREDS["credentials<br/>(stdin, plaintext)"] --> SEAL["botlockbox seal<br/>--recipient age1se1q…"]
+        SEAL -->|"device-bound ciphertext"| SAGE["secrets.age"]
     end
 
     subgraph runtime["Every login — launchd user-session agent"]
         direction LR
-        LAUNCHD["launchd"] -->|"starts at login\nKeepAlive: true"| SERVE["botlockbox serve\n--identity identity.txt"]
+        LAUNCHD["launchd"] -->|"starts at login, KeepAlive: true"| SERVE["botlockbox serve<br/>--identity identity.txt"]
         IDFILE -->|"identity ref"| SERVE
         SAGE -->|"ciphertext"| SERVE
-        SERVE -->|"SE decrypts silently\nno Touch ID"| MEM["secrets in\nmemguard enclaves"]
-        AGENT["AI agent / MCP / CLI\nno credentials"] -->|"HTTPS_PROXY=\nlocalhost:8080"| SERVE
-        SERVE -->|"Authorization injected\nfrom enclave"| API["External API"]
+        SERVE -->|"decrypts silently, no Touch ID"| MEM["secrets in<br/>memguard enclaves"]
+        AGENT["AI agent / MCP / CLI<br/>no credentials"] -->|"HTTPS_PROXY=localhost:8080"| SERVE
+        SERVE -->|"Authorization injected from enclave"| API["External API"]
     end
 
-    SAGE -.->|"useless on\nany other Mac"| LOCK["🔒 device-bound"]
+    SAGE -.->|"useless on any other Mac"| LOCK["🔒 device-bound"]
 ```
 
 **One-time setup:**
@@ -196,29 +196,29 @@ flowchart TD
         direction TB
 
         subgraph setup["Job startup (root / botlockbox user)"]
-            GHS["GitHub Actions secrets\nOPENAI_KEY, GITHUB_TOKEN…"]
-            KEYGEN["age-keygen\nephemeral keypair"]
-            PUBKEY["public key\nshell variable only"]
-            PRIVKEY["private key\nshell variable only"]
+            GHS["GitHub Actions secrets<br/>OPENAI_KEY, GITHUB_TOKEN…"]
+            KEYGEN["age-keygen<br/>ephemeral keypair"]
+            PUBKEY["public key<br/>shell variable only"]
+            PRIVKEY["private key<br/>shell variable only"]
             KEYGEN --> PUBKEY
             KEYGEN --> PRIVKEY
-            GHS --> SEAL["botlockbox seal\n--recipient \$PUBKEY"]
+            GHS --> SEAL["botlockbox seal<br/>--recipient $PUBKEY"]
             PUBKEY --> SEAL
-            SEAL --> SAGE["secrets.age\nrun-scoped"]
-            PRIVKEY -->|"piped via stdin"| SERVE["botlockbox serve\n--identity-stdin"]
+            SEAL --> SAGE["secrets.age<br/>run-scoped"]
+            PRIVKEY -->|"piped via stdin"| SERVE["botlockbox serve<br/>--identity-stdin"]
             SAGE --> SERVE
-            SERVE -->|"decrypts once\nscrambles key buffer"| MEM["secrets in\nmemguard enclaves"]
+            SERVE -->|"decrypts, scrambles key buffer"| MEM["secrets in<br/>memguard enclaves"]
         end
 
         subgraph run["Agent execution (unprivileged user)"]
-            AGENT["AI agent\nuid: agent"]
-            AGENT -->|"HTTPS_PROXY=localhost:8080\nno credentials in env"| SERVE
-            SERVE -->|"Authorization injected\nfrom enclave"| API["External API"]
+            AGENT["AI agent<br/>uid: agent"]
+            AGENT -->|"HTTPS_PROXY=localhost:8080, no credentials in env"| SERVE
+            SERVE -->|"Authorization injected from enclave"| API["External API"]
         end
     end
 
-    KEYGEN -.->|"shell vars gone\nafter step exits"| GONE["🗑 ephemeral"]
-    SERVE -.->|"cannot read identity.txt\n(it does not exist)"| NOFILE["no key on disk"]
+    KEYGEN -.->|"shell vars gone after step exits"| GONE["🗑 ephemeral"]
+    SERVE -.->|"no identity.txt on disk"| NOFILE["no key on disk"]
 ```
 
 **Workflow pattern:**
@@ -290,24 +290,24 @@ This works with any MCP server that respects standard HTTP proxy environment var
 ```mermaid
 flowchart TD
     subgraph mac["Mac Host"]
-        SE["Secure Enclave\n(age-plugin-se)"]
-        BLB["botlockbox\nlisten: 0.0.0.0:8080\n(launchd agent)"]
+        SE["Secure Enclave<br/>(age-plugin-se)"]
+        BLB["botlockbox<br/>0.0.0.0:8080<br/>(launchd agent)"]
         CAPEM["~/.botlockbox/ca.pem"]
-        SE -->|"decrypts silently\nno Touch ID"| BLB
+        SE -->|"decrypts silently"| BLB
         BLB -->|"--ca-cert"| CAPEM
     end
 
     subgraph docker["Docker Desktop (bridge network)"]
-        MCP1["MCP server A\nPython\nREQUESTS_CA_BUNDLE=\n/etc/botlockbox/ca.pem"]
-        MCP2["MCP server B\nNode.js\nNODE_EXTRA_CA_CERTS=\n/etc/botlockbox/ca.pem"]
+        MCP1["MCP server A<br/>(Python)"]
+        MCP2["MCP server B<br/>(Node.js)"]
         MCP1 & MCP2 -->|"volume mount :ro"| VOL["/etc/botlockbox/ca.pem"]
     end
 
     CAPEM -->|"bind mount"| VOL
 
-    MCP1 -->|"HTTPS_PROXY=\nhost.docker.internal:8080"| BLB
-    MCP2 -->|"HTTPS_PROXY=\nhost.docker.internal:8080"| BLB
-    BLB -->|"Authorization injected\nfrom enclave"| API["External APIs\nOpenAI, GitHub…"]
+    MCP1 -->|"HTTPS_PROXY=host.docker.internal:8080"| BLB
+    MCP2 -->|"HTTPS_PROXY=host.docker.internal:8080"| BLB
+    BLB -->|"Authorization injected from enclave"| API["External APIs<br/>OpenAI, GitHub…"]
 ```
 
 **Prerequisites:**
